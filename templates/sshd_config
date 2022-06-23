@@ -1,0 +1,7 @@
+# additional config for SFTP setup start
+Match group $SFTP_USER_GROUP
+ChrootDirectory /home
+X11Forwarding no
+AllowTcpForwarding no
+ForceCommand internal-sftp
+# additional config for SFTP setup end

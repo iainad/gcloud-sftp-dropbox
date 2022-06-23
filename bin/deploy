@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+
+# set the environment
+if [ $# -eq 0 ]; then
+    DEPLOY_ENV="staging"
+else
+    DEPLOY_ENV=$1
+fi
+
+# colour vars
+GREEN='\033[1;32m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+echo -e "Deploying instance for environment: ${GREEN}$DEPLOY_ENV${NC}"
+
+# load env vars appropriate to the environment
+source .env
+source .env.$DEPLOY_ENV
+
+# check that all env variables are properly set
+declare -a REQUIRED_ENV_VARS=(
+  'SFTP_USER'
+  'DROPBOX_NAME'
+  'PROJECT_NAME'
+  'ZONE'
+  'REGION'
+  'SFTP_PASSWORD'
+  'MACHINE_TYPE'
+)
+for ENV_VAR in "${REQUIRED_ENV_VARS[@]}"
+do
+  if [ -z "${!ENV_VAR}" ]; then
+    echo -e "\n  ❌ ERROR:\n     ${RED}$ENV_VAR${NC} is not defined in your .env or .env.$DEPLOY_ENV file - script exiting\n"
+    exit 1
+  fi
+done
+
+# get directory where this script is
+SCRIPT_DIR=$(dirname "$0")
+TEMPLATE_DIR="$SCRIPT_DIR/../templates"
+
+# set template info
+STARTUP_SCRIPT_TEMPLATE=$TEMPLATE_DIR/install_script.sh
+STARTUP_SCRIPT="$SCRIPT_DIR/../dist/startup.sh"
+
+# naming the instance
+INSTANCE_NAME=$PROJECT_NAME-$DROPBOX_NAME-$DEPLOY_ENV
+
+echo -e "Instance will be named: ${GREEN}$INSTANCE_NAME${NC}\n"
+
+# checking for GS bucket
+echo "-- checking for storage bucket to connect to instance ($INSTANCE_NAME)"
+GCS_BUCKET=""
+BUCKET_EXISTS=$(gsutil ls gs://$INSTANCE_NAME 2>&1 | grep 'bucket does not exist')
+if [ "$BUCKET_EXISTS" != "" ]; then
+  echo "   ⚙️  does not exist, creating bucket $INSTANCE_NAME"
+  gsutil mb -p $PROJECT_NAME -c standard -l $REGION -b on "gs://$INSTANCE_NAME/"
+else
+  echo "   ✅ exists"
+fi
+
+# check for running instances
+echo -e "\n-- checking for running instance ($INSTANCE_NAME)"
+INSTANCE=$(gcloud compute instances list --uri --project=$PROJECT_NAME | grep $INSTANCE_NAME)
+if [ "$INSTANCE" != "" ]; then
+    echo "   ✅ Instance $INSTANCE_NAME is already defined, we'll update its startup script and re-run it"
+else
+    echo "   ⚙️  No instance exists will create a new one."
+fi
+
+if [ "$DEPLOY_ENV" == "production" ]; then
+  echo -e "\n-- since it's production, checking for reserved ip address ($INSTANCE_NAME)"
+  IP_ADDRESS=$(gcloud compute addresses list --uri --project=$PROJECT_NAME | grep $INSTANCE_NAME)
+  if [ "$DEPLOY_ENV" == "production" ] && [ "$IP_ADDRESS" == "" ]; then
+    echo "   ⚙️  IP Address does not exist for production instance, reserving one now"
+    gcloud compute addresses create --project=$PROJECT_NAME --region=$REGION $INSTANCE_NAME
+    IP_ADDRESS=$(gcloud compute addresses list --uri --project=$PROJECT_NAME | grep $INSTANCE_NAME)
+    echo "   ✅ reserved IP address URI is: $IP_ADDRESS"
+  else
+    echo "   ✅ $IP_ADDRESS"
+  fi
+fi
+
+# replace password
+SCRIPT=$(cat $STARTUP_SCRIPT_TEMPLATE)
+
+# add the SSH additioons to the file
+SSHD_ADDITIONS=$(cat $TEMPLATE_DIR/sshd_config)
+SCRIPT=$(echo "${SCRIPT//REPLACE_ME_WITH_SSH_ADDITIONS_FILE/$SSHD_ADDITIONS}")
+
+# check we don't have a blank password
+if [ "$SFTP_PASSWORD" = "" ]; then
+  echo "You must set the SFTP_PASSWORD env variable in the .env file before running this script"
+  exit 0
+fi
+# replace the password
+SCRIPT=$(echo "${SCRIPT//REPLACE_ME_WITH_SFTP_PASSWORD/$SFTP_PASSWORD}")
+
+# update the GCS bucket
+SCRIPT=$(echo "${SCRIPT//REPLACE_ME_WITH_GCS_BUCKET/$INSTANCE_NAME}")
+
+# add the user to the script
+SCRIPT=$(echo "${SCRIPT//REPLACE_ME_WITH_SFTP_USER/$SFTP_USER}")
+
+# write the install script
+echo "$SCRIPT" > "$STARTUP_SCRIPT"
+
+IP_SUFFIX=""
+# set the IP if there is one
+if [ "$IP_ADDRESS" != "" ]; then
+  IP_SUFFIX="--address $IP_ADDRESS"
+fi
+
+if [ "$INSTANCE" != "" ]; then
+  # TODO: check if it's rinning or not and offer to start it otherwise we can't update the script
+  echo -e "\n-- adding the startup script to the instance metadata..."
+  CHANGE=$(gcloud compute instances add-metadata $INSTANCE_NAME \
+      --metadata-from-file startup-script=$STARTUP_SCRIPT \
+      --project=$PROJECT_NAME \
+      --zone $ZONE 2>&1 | grep 'skipping update')
+
+  if [ "$CHANGE" == "" ]; then
+    echo "   rerunning the startup script..."
+    gcloud compute ssh $INSTANCE_NAME \
+      --project=$PROJECT_NAME \
+      --command="sudo google_metadata_script_runner --script-type startup" \
+      --zone $ZONE 
+  else
+    echo "   ✅ no change required as script is the same as previously"
+  fi
+else
+  echo -e "\n-- creating new instance: $INSTANCE_NAME in $ZONE"
+
+  gcloud compute instances create $INSTANCE_NAME \
+      --machine-type=$MACHINE_TYPE \
+      --project=$PROJECT_NAME \
+      --scopes storage-full \
+      --metadata-from-file startup-script=$STARTUP_SCRIPT \
+      --metadata enable-oslogin=TRUE \
+      --zone $ZONE \
+      --tags http-server \
+      --image-family ubuntu-1804-lts \
+      --image-project ubuntu-os-cloud $IP_SUFFIX
+
+fi
+
+echo -e "\n👍 Finished!"
